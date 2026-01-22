@@ -107,16 +107,34 @@ start_mosquitto() {
 configure_firewall() {
     info "配置防火墙..."
 
-    if command -v ufw &> /dev/null; then
-        ufw allow 1883/tcp comment "Mosquitto MQTT"
-        info "UFW 防火墙规则已添加"
-    elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-service=mosquitto
-        firewall-cmd --reload
-        info "firewalld 防火墙规则已添加"
-    else
-        warn "未检测到防火墙，请手动配置"
+    # 安装 iptables-persistent 以保存规则
+    if ! dpkg -l | grep -q iptables-persistent; then
+        info "安装 iptables-persistent..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y iptables-persistent
     fi
+
+    # 添加 iptables 规则
+    info "添加 iptables 规则..."
+
+    # 允许 MQTT (TCP 1883)
+    iptables -A INPUT -p tcp --dport 1883 -j ACCEPT
+
+    # 允许已建立的连接
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # 允许本地回环
+    iptables -A INPUT -i lo -j ACCEPT
+
+    # 保存规则
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save
+    else
+        iptables-save > /etc/iptables/rules.v4
+    fi
+
+    info "iptables 防火墙规则已添加并保存"
+    warn "请确保系统已安装 iptables-persistent 以使规则重启后生效"
 }
 
 # 测试连接

@@ -96,9 +96,26 @@ sudo systemctl status nodefoundry
 确保防火墙允许这些端口的流量：
 
 ```bash
-# 允许 DHCP
-sudo ufw allow 67/udp
+# 安装 iptables-persistent（用于保存规则）
+sudo apt-get install -y iptables-persistent
 
-# 允许 HTTP
-sudo ufw allow 8080/tcp
+# 允许 DHCP (UDP 67)
+sudo iptables -A INPUT -p udp --dport 67 -j ACCEPT
+
+# 允许 HTTP API (TCP 8080)
+sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
+
+# 允许已建立的连接
+sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# 允许本地回环
+sudo iptables -A INPUT -i lo -j ACCEPT
+
+# 保存规则
+sudo netfilter-persistent save
+# 或使用
+sudo iptables-save > /etc/iptables/rules.v4
+
+# 查看当前规则
+sudo iptables -L -n -v
 ```
