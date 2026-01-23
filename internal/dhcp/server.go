@@ -327,6 +327,6 @@ func (s *DHCPServer) getBootFile(resp *dhcpv4.DHCPv4) string {
 		}
 	}
 
-	// 默认返回 iPXE 链式启动文件
-	return "undionly.kpxe"
+	// 默认返回 iPXE EFI 版本
+	return "ipxe.efi"
 }
