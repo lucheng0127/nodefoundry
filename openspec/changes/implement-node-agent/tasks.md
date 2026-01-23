@@ -39,30 +39,48 @@
 - [ ] 6.2 添加 `/agent/nodefoundry-agent.service` 端点
 - [ ] 6.3 准备 systemd service 文件模板
 
-## 7. Agent 编译
+## 7. DHCP 网络配置持久化
 
-- [ ] 7.1 添加 Makefile 编译目标（`make build-agent`）
-- [ ] 7.2 配置交叉编译：linux/arm64 (RK3588)
-- [ ] 7.3 添加编译产物输出目录管理
+- [ ] 7.1 扩展 Node 模型，添加网络配置字段（Netmask、Gateway、DNS）
+- [ ] 7.2 修改 DHCP 服务器，分配 IP 时持久化网络配置到节点记录
+- [ ] 7.3 实现服务重启后恢复网络配置（从 bbolt 加载）
+- [ ] 7.4 添加 API 支持查询和更新节点网络配置
 
-## 8. preseed 集成
+## 8. 静态网络配置生成
 
-- [ ] 8.1 更新 `internal/ipxe/preseed.go` 中的 late_command
-- [ ] 8.2 添加 Agent 下载和安装命令
-- [ ] 8.3 添加 Agent 服务启用命令
-- [ ] 8.4 更新 `scripts/preseed-example.cfg` 参考文件
+- [ ] 8.1 修改 preseed 生成器，根据节点记录生成静态网络配置
+- [ ] 8.2 支持条件判断：有 IP 则静态，无 IP 则 DHCP
+- [ ] 8.3 验证生成的 preseed 文件格式正确
+- [ ] 8.4 测试静态网络配置安装流程
 
-## 9. 测试
+## 9. Agent 编译
 
-- [ ] 9.1 单元测试：MAC 地址获取
-- [ ] 9.2 单元测试：系统信息收集
-- [ ] 9.3 单元测试：命令处理器
-- [ ] 9.4 集成测试：Agent MQTT 通信
-- [ ] 9.5 测试：Agent 在真实节点上的安装和运行
+- [ ] 9.1 添加 Makefile 编译目标（`make build-agent`）
+- [ ] 9.2 配置交叉编译：linux/arm64 (RK3588)
+- [ ] 9.3 添加编译产物输出目录管理
 
-## 10. 文档和部署
+## 10. preseed 集成
 
-- [ ] 10.1 更新 README.md 添加 Agent 说明
-- [ ] 10.2 编写 Agent 部署文档
-- [ ] 10.3 添加 systemd 服务配置说明
-- [ ] 10.4 更新 Taskfile.yml 添加 Agent 相关任务
+- [ ] 10.1 更新 `internal/ipxe/preseed.go` 中的 late_command
+- [ ] 10.2 添加 Agent 下载和安装命令
+- [ ] 10.3 添加 Agent 服务启用命令
+- [ ] 10.4 更新 `scripts/preseed-example.cfg` 参考文件
+- [ ] 10.5 验证静态网络配置的 preseed 生成
+
+## 11. 测试
+
+- [ ] 11.1 单元测试：MAC 地址获取
+- [ ] 11.2 单元测试：系统信息收集
+- [ ] 11.3 单元测试：命令处理器
+- [ ] 11.4 集成测试：Agent MQTT 通信
+- [ ] 11.5 集成测试：DHCP 网络配置持久化
+- [ ] 11.6 集成测试：静态网络配置安装流程
+- [ ] 11.7 测试：Agent 在真实节点上的安装和运行
+
+## 12. 文档和部署
+
+- [ ] 12.1 更新 README.md 添加 Agent 说明
+- [ ] 12.2 编写 Agent 部署文档
+- [ ] 12.3 添加 systemd 服务配置说明
+- [ ] 12.4 编写静态网络配置使用文档
+- [ ] 12.5 更新 Taskfile.yml 添加 Agent 相关任务

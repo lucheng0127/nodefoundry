@@ -394,3 +394,508 @@ lateCommand := fmt.Sprintf(`
 3. **版本管理**: 如何处理 Agent 升级？
    - 当前决策：手动重新安装
    - 未来可能：支持 `/node/{mac}/command: update`
+
+4. **静态网络配置方式**: Debian 12 使用哪种网络配置工具？
+   - 当前决策：优先使用 preseed 内置的 netcfg（传统方式）
+   - 备选方案：NetworkManager（更现代，但需要额外安装）
+   - **决策**: 在 preseed 中检测环境，如果有 NetworkManager 则使用它，否则使用 netcfg
+
+## Additional Design: 静态网络配置继承
+
+### 背景
+
+在 NodeFoundry Server 作为网关（路由器）的场景下：
+- 集群内无外部 DHCP 服务
+- NodeFoundry DHCP 服务器为节点分配 IP
+- 安装后系统需要使用相同 IP（静态配置）
+
+### Decision 7: 网络配置持久化
+
+**选择**: DHCP 分配的网络配置持久化到节点记录
+
+**实现**:
+```go
+// Node 模型扩展
+type Node struct {
+    MAC           string          `json:"mac"`
+    IP            string          `json:"ip,omitempty"`
+    Netmask       string          `json:"netmask,omitempty"`
+    Gateway       string          `json:"gateway,omitempty"`
+    DNS           string          `json:"dns,omitempty"`
+    Hostname      string          `json:"hostname,omitempty"`
+    Status        string          `json:"status"`
+    LastHeartbeat time.Time       `json:"last_heartbeat,omitempty"`
+    CreatedAt     time.Time       `json:"created_at"`
+    UpdatedAt     time.Time       `json:"updated_at"`
+    Extra         json.RawMessage `json:"extra,omitempty"`
+}
+```
+
+### DHCP Handler 实现（基于 MAC 的固定 IP 分配）
+
+```go
+// DHCPServer DHCP 服务器
+type DHCPServer struct {
+    addr         string
+    repo         db.NodeRepository
+    ipPool       *IPPool  // IP 池管理器
+    subnet       string   // 从环境变量加载：DHCP_SUBNET（如 255.255.255.0 或 255.255.0.0）
+    gateway      string   // 从环境变量加载：DHCP_GATEWAY
+    dns          string   // 从环境变量加载：DHCP_DNS
+    proxyMode    bool     // 从环境变量加载：DHCP_PROXY_MODE
+    logger       *zap.Logger
+    server       *dhcpv4.Server
+}
+
+// handleDiscover 处理 DHCPDISCOVER
+func (s *DHCPServer) handleDiscover(pkt *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
+    mac := pkt.ClientHWAddr.String()
+
+    // ProxyDHCP 模式：不分配 IP，仅返回引导选项
+    if s.proxyMode {
+        return s.handleProxyDiscover(pkt)
+    }
+
+    // 1. 从 bbolt 检查 Node.IP
+    node, err := s.repo.FindByMAC(context.Background(), mac)
+    if err != nil {
+        // 节点不存在，创建新节点
+        node = &model.Node{
+            MAC:    mac,
+            Status: model.STATE_DISCOVERED,
+        }
+    }
+
+    // 2. 如果 Node.IP 为空，从 IP 池分配新 IP
+    if node.IP == "" {
+        ip, err := s.ipPool.Allocate(mac)
+        if err != nil {
+            return nil, fmt.Errorf("IP pool exhausted: %w", err)
+        }
+        node.IP = ip
+        node.Netmask = s.subnet  // 使用配置的子网掩码
+        node.Gateway = s.gateway
+        node.DNS = s.dns
+
+        // 持久化到 bbolt
+        if err := s.repo.Save(context.Background(), node); err != nil {
+            return nil, fmt.Errorf("failed to save node: %w", err)
+        }
+        s.logger.Info("Allocated new IP", zap.String("mac", mac), zap.String("ip", ip))
+    }
+
+    // 3. 构建 DHCPOFFER（使用固定 IP）
+    resp, err := dhcpv4.New()
+    if err != nil {
+        return nil, err
+    }
+
+    resp.MessageType = dhcpv4.MessageTypeOffer
+    resp.ServerIPAddr = net.ParseIP(s.gateway)  // siaddr
+    resp.YourIPAddr = net.ParseIP(node.IP)      // 分配的 IP
+    resp.SubnetMask = net.ParseIP(s.subnet)     // 子网掩码
+    resp.Router = []net.IP{net.ParseIP(s.gateway)}
+    resp.DNS = []net.IP{net.ParseIP(s.dns)}
+    resp.IPAddressLeaseTime = 24 * time.Hour
+
+    // Boot options
+    resp.BootFileName = cfg.BootFilename
+    resp.ServerHostName = s.gateway
+
+    return resp, nil
+}
+
+// handleProxyDiscover 处理 ProxyDHCP 模式的 DHCPDISCOVER
+// ProxyDHCP 模式：不分配 IP，仅返回引导选项
+func (s *DHCPServer) handleProxyDiscover(pkt *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
+    mac := pkt.ClientHWAddr.String()
+
+    // ProxyDHCP: 仅创建/更新节点记录（不分配 IP）
+    node, err := s.repo.FindByMAC(context.Background(), mac)
+    if err != nil {
+        // 节点不存在，创建新节点（无 IP）
+        node = &model.Node{
+            MAC:    mac,
+            Status: model.STATE_DISCOVERED,
+        }
+        if err := s.repo.Save(context.Background(), node); err != nil {
+            s.logger.Error("Failed to save node", zap.String("mac", mac), zap.Error(err))
+        }
+    }
+
+    // 构建 ProxyDHCP DHCPOFFER（仅包含引导选项，不含 IP）
+    resp, err := dhcpv4.New()
+    if err != nil {
+        return nil, err
+    }
+
+    resp.MessageType = dhcpv4.MessageTypeOffer
+    resp.ServerIPAddr = net.ParseIP(s.gateway)
+
+    // ProxyDHCP: 不包含 YourIP, SubnetMask, Router, DNS
+    // 仅包含引导选项
+    resp.BootFileName = cfg.BootFilename
+    resp.ServerHostName = s.gateway
+
+    s.logger.Debug("ProxyDHCP offer sent", zap.String("mac", mac))
+    return resp, nil
+}
+
+// handleRequest 处理 DHCPREQUEST（续租）
+func (s *DHCPServer) handleRequest(pkt *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
+    // ProxyDHCP 模式：忽略 DHCPREQUEST
+    if s.proxyMode {
+        s.logger.Debug("ProxyDHCP: ignoring DHCPREQUEST")
+        return nil, nil
+    }
+
+    mac := pkt.ClientHWAddr.String()
+
+    // 获取节点，返回已分配的固定 IP
+    node, err := s.repo.FindByMAC(context.Background(), mac)
+    if err != nil {
+        return nil, fmt.Errorf("node not found: %s", mac)
+    }
+
+    if node.IP == "" {
+        return nil, fmt.Errorf("node has no IP assigned")
+    }
+
+    // 续租：延长租约时间，返回相同的 IP
+    resp, _ := dhcpv4.New()
+    resp.MessageType = dhcpv4.MessageTypeAck
+    resp.YourIPAddr = net.ParseIP(node.IP)
+    resp.SubnetMask = net.ParseIP(s.subnet)  // 使用配置的子网掩码
+    resp.Router = []net.IP{net.ParseIP(s.gateway)}
+    resp.DNS = []net.IP{net.ParseIP(s.dns)}
+    resp.IPAddressLeaseTime = 24 * time.Hour
+
+    return resp, nil
+}
+```
+
+### IP 池管理（内存 + 持久化）
+
+```go
+// IPPool IP 池管理器
+type IPPool struct {
+    db        *bbolt.DB
+    start     string  // DHCP_POOL_START
+    end       string  // DHCP_POOL_END
+    allocated map[string]string  // 内存 map: MAC -> IP
+    mu        sync.RWMutex
+}
+
+const BUCKET_IP_ALLOCATIONS = "ip_allocations"
+
+// NewIPPool 创建 IP 池，从 bbolt 恢复已分配的 IP
+func NewIPPool(db *bbolt.DB, start, end string) (*IPPool, error) {
+    pool := &IPPool{
+        db:        db,
+        start:     start,
+        end:       end,
+        allocated: make(map[string]string),
+    }
+
+    // 初始化 bucket
+    if err := db.Update(func(tx *bbolt.Tx) error {
+        _, err := tx.CreateBucketIfNotExists([]byte(BUCKET_IP_ALLOCATIONS))
+        return err
+    }); err != nil {
+        return nil, err
+    }
+
+    // 从 bbolt 恢复已分配的 IP
+    if err := db.View(func(tx *bbolt.Tx) error {
+        b := tx.Bucket([]byte(BUCKET_IP_ALLOCATIONS))
+        if b == nil {
+            return nil
+        }
+        return b.ForEach(func(k, v []byte) error {
+            mac := string(k)
+            ip := string(v)
+            pool.allocated[mac] = ip
+            return nil
+        })
+    }); err != nil {
+        return nil, err
+    }
+
+    return pool, nil
+}
+
+// Allocate 分配新 IP 给 MAC
+func (p *IPPool) Allocate(mac string) (string, error) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    // 检查是否已分配
+    if ip, exists := p.allocated[mac]; exists {
+        return ip, nil
+    }
+
+    // 从 IP 池中寻找可用 IP
+    startIP := net.ParseIP(p.start)
+    endIP := net.ParseIP(p.end)
+
+    for ip := startIP; ipLessEqual(ip, endIP); inc(ip) {
+        ipStr := ip.String()
+
+        // 检查是否已被占用
+        if !p.isAllocated(ipStr) {
+            p.allocated[mac] = ipStr
+
+            // 持久化到 bbolt
+            if err := p.db.Update(func(tx *bbolt.Tx) error {
+                b := tx.Bucket([]byte(BUCKET_IP_ALLOCATIONS))
+                return b.Put([]byte(mac), []byte(ipStr))
+            }); err != nil {
+                delete(p.allocated, mac)
+                return "", err
+            }
+
+            return ipStr, nil
+        }
+    }
+
+    return "", fmt.Errorf("IP pool exhausted")
+}
+
+// isAllocated 检查 IP 是否已被分配
+func (p *IPPool) isAllocated(ip string) bool {
+    for _, allocated := range p.allocated {
+        if allocated == ip {
+            return true
+        }
+    }
+    return false
+}
+```
+
+### Decision 8: iPXE 脚本生成（传递网络参数）
+
+```go
+// GenerateByStatus 生成 iPXE 脚本，传递网络参数到 preseed
+func (g *Generator) GenerateByStatus(ctx context.Context, mac string) (string, error) {
+    node, err := g.repo.FindByMAC(ctx, mac)
+    if err != nil {
+        return "", err
+    }
+
+    switch node.Status {
+    case model.STATE_INSTALLING:
+        return g.generateInstallScript(mac, node), nil
+    // ... 其他状态
+    }
+}
+
+// generateInstallScript 生成安装脚本，传递 IP 参数
+func (g *Generator) generateInstallScript(mac string, node *model.Node) string {
+    // 从 bbolt 取 Node.IP
+    assignedIP := node.IP
+
+    return fmt.Sprintf(`#!ipxe
+set node_url http://%s
+set mac %s
+set arch ${buildarch}
+
+# 获取当前分配的 IP
+set assigned-ip %s
+
+# kernel 启动，传递网络参数到 preseed URL
+kernel https://mirrors.ustc.edu.cn/debian/dists/bookworm/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/linux \
+    auto=true priority=critical \
+    url=${node_url}/preseed/${mac}?ip=${assigned-ip}&netmask=%s&gateway=%s&dns=%s
+
+initrd https://mirrors.ustc.edu.cn/debian/dists/bookworm/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/initrd.gz
+boot
+`, g.serverAddr, mac, assignedIP, node.Netmask, node.Gateway, node.DNS)
+}
+```
+
+### Decision 9: preseed 生成（处理查询参数）
+
+```go
+// PreseedGenerator preseed 生成器
+type PreseedGenerator struct {
+    repo    db.NodeRepository
+    tpl     *template.Template  // preseed 模板
+}
+
+// Generate 生成 preseed 配置
+func (g *PreseedGenerator) Generate(mac string, query url.Values) (string, error) {
+    node, err := g.repo.FindByMAC(context.Background(), mac)
+    if err != nil {
+        return "", err
+    }
+
+    // 验证状态
+    if node.Status != model.STATE_INSTALLING {
+        return "", fmt.Errorf("node not in installing state: %s", node.Status)
+    }
+
+    // 从 query 参数获取网络配置
+    ip := query.Get("ip")
+    netmask := query.Get("netmask")
+    gateway := query.Get("gateway")
+    dns := query.Get("dns")
+
+    // 验证 IP 与 Node.IP 一致
+    if ip != node.IP {
+        return "", fmt.Errorf("IP mismatch: query=%s, node=%s", ip, node.IP)
+    }
+
+    // 填充模板数据
+    data := struct {
+        MAC      string
+        Hostname string
+        IP       string
+        Netmask  string
+        Gateway  string
+        DNS      string
+    }{
+        MAC:      mac,
+        Hostname: fmt.Sprintf("node-%s", mac),
+        IP:       ip,
+        Netmask:  netmask,
+        Gateway:  gateway,
+        DNS:      dns,
+    }
+
+    var buf bytes.Buffer
+    if err := g.tpl.Execute(&buf, data); err != nil {
+        return "", err
+    }
+
+    return buf.String(), nil
+}
+```
+
+**preseed 模板** (`templates/preseed.cfg`):
+```bash
+d-i debian-installer/locale string en_US
+d-i keyboard-configuration/xkb-keymap select us
+
+# 静态网络配置（从查询参数动态替换）
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/disable_dhcp boolean true
+d-i netcfg/get_ipaddress string {{.IP}}
+d-i netcfg/get_netmask string {{.Netmask}}
+d-i netcfg/get_gateway string {{.Gateway}}
+d-i netcfg/get_nameservers string {{.DNS}}
+d-i netcfg/confirm_static boolean true
+
+d-i netcfg/get_hostname string {{.Hostname}}
+d-i netcfg/get_domain string
+
+# 镜像配置
+d-i mirror/country string manual
+d-i mirror/http/hostname string mirrors.ustc.edu.cn
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+
+# ... 其余配置
+
+# Agent 安装（获取当前 DHCP 网卡的 MAC）
+d-i preseed/late_command string \
+  DHCP_iface=$(ip route | grep default | awk '{print $5}') && \
+  DHCP_MAC=$(cat /sys/class/net/${DHCP_iface}/address | tr -d ':') && \
+  in-target wget http://%{server}:8080/agent/nodefoundry-agent -O /usr/local/bin/nodefoundry-agent && \
+  in-target chmod +x /usr/local/bin/nodefoundry-agent && \
+  in-target wget http://%{server}:8080/agent/nodefoundry-agent.service -O /etc/systemd/system/nodefoundry-agent.service && \
+  in-target sh -c 'echo "NF_MAC='${DHCP_MAC}'" > /etc/default/nodefoundry-agent' && \
+  in-target sh -c 'echo "NF_MQTT_BROKER=%{server}:1883" >> /etc/default/nodefoundry-agent' && \
+  in-target systemctl enable nodefoundry-agent.service
+```
+
+### 环境变量配置
+
+```bash
+# DHCP 配置
+NF_DHCP_SUBNET=255.255.255.0          # 子网掩码（根据实际网络配置，如 255.255.0.0）
+NF_DHCP_GATEWAY=192.168.1.1           # 网关（服务器 IP）
+NF_DHCP_DNS=192.168.1.1                # DNS 服务器
+NF_DHCP_POOL_START=192.168.1.100      # IP 池起始
+NF_DHCP_POOL_END=192.168.1.200        # IP 池结束
+NF_DHCP_PROXY_MODE=false              # ProxyDHCP 模式（true=仅引导选项，不分配 IP）
+```
+
+**ProxyDHCP 模式说明**：
+- 当 `NF_DHCP_PROXY_MODE=true` 时，DHCP 服务器仅响应引导选项
+- 不分配 IP 地址，不进行 IP 持久化
+- 适用于存在外部 DHCP 服务器的环境
+
+### 数据流程总结
+
+**标准 DHCP 模式**（NF_DHCP_PROXY_MODE=false）:
+```
+1. DHCPDISCOVER (MAC: AABBCCDDEEFF)
+   ↓
+2. DHCP Handler: 检查 Node.IP，无则从 IP 池分配
+   ↓
+3. 持久化到 bbolt: Node.IP = "192.168.1.100", Netmask = "255.255.255.0"
+   ↓
+4. DHCPOFFER: YourIP = 192.168.1.100, Netmask（从配置）, Gateway, DNS
+   ↓
+5. DHCPACK: 确认分配
+   ↓
+6. iPXE 引导: chain http://server/boot/aabbccddeeff/boot.ipxe
+   ↓
+7. iPXE 脚本: set assigned-ip 192.168.1.100
+   ↓
+8. chain 到 preseed URL with query params:
+   http://server/preseed/aabbccddeeff?ip=192.168.1.100&netmask=255.255.255.0&gateway=192.168.1.1&dns=192.168.1.1
+   ↓
+9. preseed 生成: 验证 Node.Status==installing, 验证 ip==Node.IP
+   ↓
+10. preseed 模板替换: 静态网络配置
+   ↓
+11. Debian 安装: 使用静态 IP
+   ↓
+12. 安装完成，系统重启后使用相同 IP（静态配置）
+```
+
+**ProxyDHCP 模式**（NF_DHCP_PROXY_MODE=true）:
+```
+1. DHCPDISCOVER (MAC: AABBCCDDEEFF)
+   ↓
+2. DHCP Handler: 仅创建节点记录（不分配 IP）
+   ↓
+3. ProxyDHCPOFFER: 仅包含引导选项（siaddr, bootfile）
+   ↓
+4. 主 DHCP 服务器: 分配 IP（如 192.168.1.50）
+   ↓
+5. DHCPACK: 主服务器确认 IP
+   ↓
+6. iPXE 引导: chain http://server/boot/aabbccddeeff/boot.ipxe
+   ↓
+7. iPXE 脚本: 获取当前 IP（通过 ${net0/ip}）
+   ↓
+8. chain 到 preseed URL:
+   http://server/preseed/aabbccddeeff（无 query 参数，或使用 DHCP）
+   ↓
+9. preseed 生成: 无静态 IP，使用 DHCP
+   ↓
+10. Debian 安装: 使用 DHCP 获取 IP
+```
+
+### 风险与缓解
+
+**风险 1**: 静态 IP 冲突
+- **缓解**: DHCP IP 池管理 + bbolt 持久化确保不重复分配
+
+**风险 2**: 服务重启后 IP 丢失
+- **缓解**: IP 池从 bbolt 恢复（ip_allocations bucket + nodes bucket）
+
+**风险 3**: preseed URL 参数被篡改
+- **缓解**: 验证 query.ip == Node.IP，拒绝不匹配的请求
+
+**风险 4**: 网络配置文件格式变化（Debian 版本）
+- **缓解**: preseed 动态生成，适配不同版本
+
+**风险 5**: ProxyDHCP 模式误配置导致 IP 分配混乱
+- **缓解**:
+  - ProxyDHCP 模式明确忽略 DHCPREQUEST
+  - 不创建 ip_allocations 记录
+  - 节点记录中 IP 字段保持为空
+  - 日志中明确标记 "ProxyDHCP mode"
