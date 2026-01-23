@@ -78,6 +78,7 @@ go build -o bin/nodefoundry ./cmd/nodefoundry
 ### 配置环境变量
 
 ```bash
+# 基础配置
 export NF_HTTP_ADDR=:8080
 export NF_DHCP_ADDR=:67
 export NF_MQTT_BROKER=localhost:1883
@@ -85,6 +86,20 @@ export NF_MIRROR_URL=mirrors.ustc.edu.cn
 export NF_DB_PATH=./data/nodes.db
 export NF_LOG_LEVEL=info
 export NF_SERVER_ADDR=192.168.1.100:8080  # 替换为你的服务器 IP
+
+# DHCP 高级配置（可选）
+# 标准模式：完整 DHCP 服务器
+# export NF_DHCP_INTERFACE=eth0                    # 绑定网卡（可选）
+# export NF_DHCP_IP_POOL_START=192.168.1.100       # IP 池起始
+# export NF_DHCP_IP_POOL_END=192.168.1.200         # IP 池结束
+# export NF_DHCP_NETMASK=255.255.255.0
+# export NF_DHCP_GATEWAY=192.168.1.1
+# export NF_DHCP_DNS=8.8.8.8,8.8.4.4
+# export NF_DHCP_LEASE_TIME=86400
+
+# ProxyDHCP 模式：兼容现有 DHCP
+# export NF_DHCP_PROXY_MODE=true
+# export NF_DHCP_TFTP_SERVER=192.168.1.100
 ```
 
 ### 运行服务器
@@ -246,6 +261,15 @@ curl -X POST http://localhost:8080/api/v1/nodes \
 |---------|-------|------|
 | `NF_HTTP_ADDR` | `:8080` | HTTP 服务地址 |
 | `NF_DHCP_ADDR` | `:67` | DHCP 服务地址 |
+| `NF_DHCP_INTERFACE` | (无) | DHCP 绑定的网卡接口 |
+| `NF_DHCP_IP_POOL_START` | (无) | IP 池起始地址（标准模式） |
+| `NF_DHCP_IP_POOL_END` | (无) | IP 池结束地址（标准模式） |
+| `NF_DHCP_NETMASK` | `255.255.255.0` | 子网掩码 |
+| `NF_DHCP_GATEWAY` | (无) | 网关地址 |
+| `NF_DHCP_DNS` | `8.8.8.8,8.8.4.4` | DNS 服务器 |
+| `NF_DHCP_LEASE_TIME` | `86400` | 租约时间（秒） |
+| `NF_DHCP_TFTP_SERVER` | (自动推断) | TFTP 服务器 IP |
+| `NF_DHCP_PROXY_MODE` | `false` | ProxyDHCP 模式 |
 | `NF_MQTT_BROKER` | `localhost:1883` | MQTT Broker 地址 |
 | `NF_MIRROR_URL` | `mirrors.ustc.edu.cn` | Debian 镜像源 |
 | `NF_DB_PATH` | `/var/lib/nodefoundry/nodes.db` | 数据库路径 |
@@ -287,6 +311,62 @@ go test ./...
 2. **无认证**: API 未实现认证机制
 3. **单机部署**: 使用 bbolt 嵌入式数据库，不支持分布式
 4. **基础 DHCP**: DHCP 实现较简单，不支持复杂的网络配置
+
+## DHCP 配置模式
+
+NodeFoundry 支持两种 DHCP 运行模式，根据网络环境选择：
+
+### 标准模式（完整 DHCP 服务器）
+
+适用场景：独立网络、测试环境、无现有 DHCP 服务器
+
+```bash
+export NF_DHCP_INTERFACE=eth0                    # 绑定网卡（可选）
+export NF_DHCP_IP_POOL_START=192.168.1.100       # IP 池起始
+export NF_DHCP_IP_POOL_END=192.168.1.200         # IP 池结束
+export NF_DHCP_NETMASK=255.255.255.0
+export NF_DHCP_GATEWAY=192.168.1.1
+export NF_DHCP_DNS=8.8.8.8,8.8.4.4
+```
+
+**注意**：确保网络中没有其他 DHCP 服务器，避免冲突。
+
+### ProxyDHCP 模式（兼容现有 DHCP）
+
+适用场景：生产环境、已有 DHCP 服务器、企业网络
+
+```bash
+export NF_DHCP_INTERFACE=eth0
+export NF_DHCP_PROXY_MODE=true                   # 启用 ProxyDHCP
+export NF_DHCP_TFTP_SERVER=192.168.1.100         # TFTP 服务器 IP
+```
+
+ProxyDHCP 模式下：
+- 仅提供 PXE 引导选项，不分配 IP
+- 与现有 DHCP 服务器和平共存
+- 主 DHCP 处理 IP 分配，NodeFoundry 处理引导
+
+## 故障排查
+
+### 节点无法获取 IP
+
+- 检查 DHCP 服务是否运行：`sudo systemctl status nodefoundry`
+- 检查端口 67 是否被占用：`sudo netstat -ulnp | grep 67`
+- 检查防火墙规则：`sudo iptables -L -n -v | grep 67`
+- 如果是标准模式，确保网络中没有其他 DHCP 服务器
+
+### 节点无法启动 PXE
+
+- 检查 `NF_DHCP_TFTP_SERVER` 是否正确设置
+- 确保独立的 TFTP 服务器已安装并运行
+- 检查 TFTP 服务器根目录是否存在 `undionly.kpxe` 和 `ipxe.efi`
+- 查看 DHCP 日志：`sudo journalctl -u nodefoundry -f`
+
+### ProxyDHCP 不工作
+
+- 确保主 DHCP 服务器允许 ProxyDHCP 响应
+- 检查 `NF_DHCP_PROXY_MODE=true` 已设置
+- 某些 DHCP 服务器可能需要配置以允许 ProxyDHCP
 
 ## 许可证
 

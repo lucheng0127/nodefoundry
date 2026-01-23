@@ -106,6 +106,15 @@ install_config() {
 
 NF_HTTP_ADDR=:8080
 NF_DHCP_ADDR=:67
+# NF_DHCP_INTERFACE=eth0                    # 绑定到指定网卡（可选）
+# NF_DHCP_IP_POOL_START=192.168.1.100       # IP 池起始地址（标准模式）
+# NF_DHCP_IP_POOL_END=192.168.1.200         # IP 池结束地址（标准模式）
+# NF_DHCP_NETMASK=255.255.255.0             # 子网掩码
+# NF_DHCP_GATEWAY=192.168.1.1               # 网关
+# NF_DHCP_DNS=8.8.8.8,8.8.4.4               # DNS 服务器
+# NF_DHCP_LEASE_TIME=86400                  # 租约时间（秒）
+# NF_DHCP_TFTP_SERVER=192.168.1.100         # TFTP 服务器 IP
+# NF_DHCP_PROXY_MODE=false                  # ProxyDHCP 模式（true/false）
 NF_MQTT_BROKER=localhost:1883
 NF_MIRROR_URL=mirrors.ustc.edu.cn
 NF_DB_PATH=/var/lib/nodefoundry/nodes.db
@@ -231,8 +240,19 @@ show_completion() {
     info "  PUT  http://localhost:8080/api/v1/nodes/:mac"
     info "  GET  http://localhost:8080/health"
     info ""
-    warn "请确保在 $CONFIG_DIR/defaults 中设置 NF_SERVER_ADDR"
-    warn "以便节点可以正确连接到此服务器"
+    warn "重要配置提示:"
+    warn "1. 请确保在 $CONFIG_DIR/defaults 中设置 NF_SERVER_ADDR"
+    warn "2. 根据网络环境选择 DHCP 模式："
+    warn "   - 标准模式: 取消注释 NF_DHCP_IP_POOL_START/END 等配置"
+    warn "   - ProxyDHCP 模式: 设置 NF_DHCP_PROXY_MODE=true"
+    warn "3. 如果使用标准 DHCP 模式，确保网络中没有其他 DHCP 服务器"
+    info ""
+    warn "TFTP 服务器要求:"
+    warn "NodeFoundry 的 DHCP 引导功能需要独立的 TFTP 服务器提供 iPXE 文件。"
+    warn "请安装并配置 TFTP 服务器（如 tftp-hpa 或 atftpd），将以下文件放到 TFTP 根目录："
+    warn "  - undionly.kpxe (BIOS PXE chainloading)"
+    warn "  - ipxe.efi (UEFI iPXE)"
+    warn "下载地址: https://boot.ipxe.org/"
     info ""
 }
 

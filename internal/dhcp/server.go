@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
@@ -15,19 +16,39 @@ import (
 
 // DHCPServer DHCP 服务器
 type DHCPServer struct {
-	addr   string
-	repo   db.NodeRepository
-	logger *zap.Logger
-	server *server4.Server
+	addr        string
+	iface       string // 绑定的网卡接口名（如 eth0），空则监听所有接口
+	repo        db.NodeRepository
+	logger      *zap.Logger
+	server      *server4.Server
+	ipManager   *IPManager
+	tftpServer  string // TFTP 服务器 IP
+	proxyMode   bool   // ProxyDHCP 模式
 }
 
 // NewDHCPServer 创建 DHCP 服务器
-func NewDHCPServer(addr string, repo db.NodeRepository, logger *zap.Logger) *DHCPServer {
+func NewDHCPServer(addr, iface string, repo db.NodeRepository, logger *zap.Logger) *DHCPServer {
 	return &DHCPServer{
 		addr:   addr,
+		iface:  iface,
 		repo:   repo,
 		logger: logger,
 	}
+}
+
+// SetIPManager 设置 IP 池管理器
+func (s *DHCPServer) SetIPManager(ipm *IPManager) {
+	s.ipManager = ipm
+}
+
+// SetTFTPServer 设置 TFTP 服务器地址
+func (s *DHCPServer) SetTFTPServer(tftp string) {
+	s.tftpServer = tftp
+}
+
+// SetProxyMode 设置 ProxyDHCP 模式
+func (s *DHCPServer) SetProxyMode(proxy bool) {
+	s.proxyMode = proxy
 }
 
 // Start 启动 DHCP 服务器
@@ -38,14 +59,22 @@ func (s *DHCPServer) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to resolve DHCP address: %w", err)
 	}
 
+	// 确定监听接口
+	ifname := ""
+	if s.iface != "" {
+		ifname = s.iface
+	}
+
 	// 创建 DHCP 服务器
-	// 空字符串 ifname 表示监听所有接口
-	s.server, err = server4.NewServer("", laddr, s.handleDHCP)
+	s.server, err = server4.NewServer(ifname, laddr, s.handleDHCP)
 	if err != nil {
 		return fmt.Errorf("failed to create DHCP server: %w", err)
 	}
 
-	s.logger.Info("DHCP server starting", zap.String("addr", s.addr))
+	s.logger.Info("DHCP server starting",
+		zap.String("addr", s.addr),
+		zap.String("interface", s.iface),
+	)
 
 	// 在 goroutine 中启动服务器
 	go func() {
@@ -71,11 +100,24 @@ func (s *DHCPServer) handleDHCP(conn net.PacketConn, peer net.Addr, msg *dhcpv4.
 		return
 	}
 
-	// 只处理 DHCPDISCOVER 和 DHCPREQUEST
+	// ProxyDHCP 模式：只响应 DISCOVER
+	if s.proxyMode {
+		if msg.MessageType() == dhcpv4.MessageTypeDiscover {
+			s.handleProxyDiscover(conn, peer, msg)
+		}
+		return
+	}
+
+	// 标准模式：处理 DISCOVER 和 REQUEST
 	if msg.MessageType() != dhcpv4.MessageTypeDiscover && msg.MessageType() != dhcpv4.MessageTypeRequest {
 		return
 	}
 
+	s.handleStandard(conn, peer, msg)
+}
+
+// handleStandard 标准模式处理
+func (s *DHCPServer) handleStandard(conn net.PacketConn, peer net.Addr, msg *dhcpv4.DHCPv4) {
 	// 提取 MAC 地址
 	mac := msg.ClientHWAddr.String()
 	if mac == "" {
@@ -134,7 +176,37 @@ func (s *DHCPServer) handleDHCP(conn net.PacketConn, peer net.Addr, msg *dhcpv4.
 	}
 }
 
-// buildResponse 构建 DHCP 响应
+// handleProxyDiscover ProxyDHCP 模式下的 DISCOVER 处理
+func (s *DHCPServer) handleProxyDiscover(conn net.PacketConn, peer net.Addr, msg *dhcpv4.DHCPv4) {
+	mac := msg.ClientHWAddr.String()
+	if mac == "" {
+		return
+	}
+
+	normalizedMAC := model.NormalizeMAC(mac)
+
+	s.logger.Debug("ProxyDHCP DISCOVER received",
+		zap.String("mac", normalizedMAC),
+		zap.String("peer", peer.String()),
+	)
+
+	// 构建 ProxyDHCPOFFER（仅包含引导选项，不含 IP）
+	resp, err := s.buildProxyOffer(msg)
+	if err != nil {
+		s.logger.Error("failed to build ProxyDHCP offer", zap.Error(err))
+		return
+	}
+
+	// 发送响应（使用广播地址）
+	if _, err := conn.WriteTo(resp.ToBytes(), peer); err != nil {
+		s.logger.Error("failed to send ProxyDHCP offer",
+			zap.String("mac", normalizedMAC),
+			zap.Error(err),
+		)
+	}
+}
+
+// buildResponse 构建标准 DHCP 响应
 func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 	var respType dhcpv4.MessageType
 
@@ -147,8 +219,6 @@ func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 		return nil, fmt.Errorf("unexpected message type: %s", req.MessageType())
 	}
 
-	// 构建响应
-	// 使用 WithOption 方法设置响应类型
 	resp, err := dhcpv4.NewReplyFromRequest(req)
 	if err != nil {
 		return nil, err
@@ -157,33 +227,106 @@ func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 	// 设置消息类型
 	resp.UpdateOption(dhcpv4.OptMessageType(respType))
 
-	// 如果请求中有特定 IP，分配该 IP；否则分配新 IP
-	if req.RequestedIPAddress() != nil {
-		resp.YourIPAddr = req.RequestedIPAddress()
+	mac := req.ClientHWAddr.String()
+
+	// IP 分配（如果配置了 IP 池）
+	if s.ipManager != nil {
+		var assignedIP net.IP
+		if req.MessageType() == dhcpv4.MessageTypeDiscover {
+			// 分配新 IP
+			assignedIP, err = s.ipManager.AllocateIP(mac, req.RequestedIPAddress())
+			if err != nil {
+				return nil, fmt.Errorf("failed to allocate IP: %w", err)
+			}
+		} else {
+			// 获取已有租约
+			assignedIP, err = s.ipManager.GetLease(mac)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get lease: %w", err)
+			}
+		}
+		resp.YourIPAddr = assignedIP
+
+		// 设置网络参数
+		resp.UpdateOption(dhcpv4.OptSubnetMask(s.ipManager.netmask))
+		if s.ipManager.gateway != nil {
+			resp.UpdateOption(dhcpv4.OptRouter(s.ipManager.gateway))
+		}
+		if len(s.ipManager.dns) > 0 {
+			resp.UpdateOption(dhcpv4.OptDNS(s.ipManager.dns...))
+		}
+		resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.ipManager.leaseTime))
 	} else {
-		// 使用客户端 IP 作为分配的 IP
-		resp.YourIPAddr = req.ClientIPAddr
+		// 向后兼容：未配置 IP 池时，回显客户端请求的 IP
+		if req.RequestedIPAddress() != nil {
+			resp.YourIPAddr = req.RequestedIPAddress()
+		} else {
+			resp.YourIPAddr = req.ClientIPAddr
+		}
+		// 设置默认租约时间（24 小时）
+		resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(24 * time.Hour))
 	}
 
-	// 设置租约时间（24 小时）
-	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(24 * 60 * 60))
-
-	// 添加 TFTP 服务器选项（用于 iPXE）
-	if tftpAddr := s.getTFTPServerAddress(); tftpAddr != "" {
-		resp.UpdateOption(dhcpv4.OptTFTPServerName(tftpAddr))
-	}
-
-	// 添加引导文件名选项
-	resp.BootFileName = "undionly.kpxe"
+	// 设置 TFTP 引导选项
+	s.setBootOptions(resp)
 
 	return resp, nil
 }
 
-// getTFTPServerAddress 获取 TFTP 服务器地址
-// 从 DHCP 监听地址推断
-func (s *DHCPServer) getTFTPServerAddress() string {
-	// 如果 DHCP 监听在 :67，使用主机的 IP
-	// 这里简化处理，返回空字符串，让 DHCP 客户端使用默认值
-	// 实际部署时，应该返回 TFTP 服务器的 IP 地址
-	return ""
+// buildProxyOffer 构建 ProxyDHCP Offer（仅包含引导选项）
+func (s *DHCPServer) buildProxyOffer(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
+	resp, err := dhcpv4.NewReplyFromRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 设置消息类型为 OFFER
+	resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
+
+	// ProxyDHCP: 不分配 IP，仅设置引导选项
+	s.setBootOptions(resp)
+
+	// 设置广播地址
+	resp.UpdateOption(dhcpv4.OptBroadcastAddress(net.IPv4bcast))
+
+	return resp, nil
+}
+
+// setBootOptions 设置 TFTP 引导选项
+func (s *DHCPServer) setBootOptions(resp *dhcpv4.DHCPv4) {
+	// siaddr (Next Server) - TFTP 服务器 IP
+	if s.tftpServer != "" {
+		if tftpIP := net.ParseIP(s.tftpServer); tftpIP != nil {
+			resp.UpdateOption(dhcpv4.OptServerIdentifier(tftpIP))
+		}
+	}
+
+	// Option 66 (TFTP Server Name)
+	if s.tftpServer != "" {
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(s.tftpServer))
+	}
+
+	// Option 67 (Bootfile Name) - 根据架构选择
+	bootfile := s.getBootFile(resp)
+	resp.UpdateOption(dhcpv4.OptBootFileName(bootfile))
+}
+
+// getBootFile 根据客户端架构选择引导文件
+func (s *DHCPServer) getBootFile(resp *dhcpv4.DHCPv4) string {
+	// 检查客户端系统架构 Option 93 (System Architecture)
+	// 使用 GenericOptionCode 将整数转换为 OptionCode 类型
+	if archOpt := resp.Options.Get(dhcpv4.GenericOptionCode(93)); archOpt != nil {
+		if len(archOpt) >= 2 {
+			arch := uint16(archOpt[0])<<8 | uint16(archOpt[1])
+			// 0 = BIOS/IA32, 7 = EFI BC, 9 = EFI x86-64
+			if arch == 0 {
+				return "undionly.kpxe" // BIOS
+			} else if arch >= 7 {
+				return "ipxe.efi" // UEFI
+			}
+		}
+	}
+
+	// 默认返回 iPXE 链式启动文件
+	return "undionly.kpxe"
 }

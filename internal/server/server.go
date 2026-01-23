@@ -62,7 +62,33 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	}
 
 	// 创建 DHCP 服务器
-	dhcpServer := dhcp.NewDHCPServer(config.DHCPAddr, repo, logger)
+	dhcpServer := dhcp.NewDHCPServer(config.DHCPAddr, config.DHCPInterface, repo, logger)
+
+	// 配置 IP 池（如果设置）
+	if config.DHCPIPPoolStart != "" && config.DHCPIPPoolEnd != "" {
+		ipManager, err := dhcp.NewIPManager(
+			config.DHCPIPPoolStart,
+			config.DHCPIPPoolEnd,
+			config.DHCPNetmask,
+			config.DHCPGateway,
+			config.DHCPDNS,
+			config.DHCPLeaseTime,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IP manager: %w", err)
+		}
+		dhcpServer.SetIPManager(ipManager)
+	}
+
+	// 设置 TFTP 服务器
+	if config.DHCPTFTPServer != "" {
+		dhcpServer.SetTFTPServer(config.DHCPTFTPServer)
+	}
+
+	// 设置 ProxyDHCP 模式
+	if config.DHCPProxyMode {
+		dhcpServer.SetProxyMode(true)
+	}
 
 	// 创建 MQTT 客户端
 	mqttClient := mqtt.NewClient(config.MQTTBroker, repo, logger)
