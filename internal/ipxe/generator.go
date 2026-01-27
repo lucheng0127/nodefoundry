@@ -64,6 +64,25 @@ chain ${node_url}/boot/${mac}/boot.ipxe || goto loop
 
 // generateInstallScript 生成安装脚本
 func (g *Generator) generateInstallScript(mac string) string {
+	// 获取节点信息以获取网络配置
+	ctx := context.Background()
+	node, err := g.repo.FindByMAC(ctx, mac)
+	netParams := ""
+	if err == nil && node.IP != "" {
+		// 如果节点有分配的 IP，传递网络参数到 preseed
+		// 格式: ?ip=xxx&netmask=xxx&gateway=xxx&dns=xxx
+		netParams = fmt.Sprintf("?ip=%s", node.IP)
+		if node.Netmask != "" {
+			netParams += fmt.Sprintf("&netmask=%s", node.Netmask)
+		}
+		if node.Gateway != "" {
+			netParams += fmt.Sprintf("&gateway=%s", node.Gateway)
+		}
+		if node.DNS != "" {
+			netParams += fmt.Sprintf("&dns=%s", node.DNS)
+		}
+	}
+
 	return fmt.Sprintf(`#!ipxe
 set node_url http://%s
 set mac %s
@@ -71,9 +90,9 @@ set arch ${buildarch}
 
 kernel https://%s/debian/dists/bookworm/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/linux
 initrd https://%s/debian/dists/bookworm/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/initrd.gz
-imgargs linux auto=true priority=critical url=${node_url}/preseed/${mac}/preseed.cfg
+imgargs linux auto=true priority=critical url=${node_url}/preseed/${mac}/preseed.cfg%s
 boot
-`, g.serverAddr, mac, g.mirrorURL, g.mirrorURL)
+`, g.serverAddr, mac, g.mirrorURL, g.mirrorURL, netParams)
 }
 
 // generateLocalBootScript 生成本地启动脚本

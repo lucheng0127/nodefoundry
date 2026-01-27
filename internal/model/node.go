@@ -11,6 +11,9 @@ import (
 type Node struct {
 	MAC           string          `json:"mac"`
 	IP            string          `json:"ip,omitempty"`
+	Netmask       string          `json:"netmask,omitempty"`       // 子网掩码
+	Gateway       string          `json:"gateway,omitempty"`       // 网关
+	DNS           string          `json:"dns,omitempty"`           // DNS 服务器（逗号分隔）
 	Hostname      string          `json:"hostname,omitempty"`
 	Status        string          `json:"status"`
 	LastHeartbeat time.Time       `json:"last_heartbeat,omitempty"`

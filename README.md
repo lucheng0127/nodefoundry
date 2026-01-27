@@ -7,8 +7,10 @@
 - **自动节点发现**: 通过 DHCP 自动发现新节点并注册
 - **无人值守安装**: 使用 iPXE 和 Debian preseed 实现自动化系统安装
 - **状态管理**: 节点状态跟踪（discovered → installing → installed）
+- **边缘节点 Agent**: 已安装节点自动运行 Agent，上报状态和执行命令
+- **静态网络配置**: 支持 DHCP 分配的 IP 持久化，安装后使用静态 IP
 - **RESTful API**: 完整的节点管理 API
-- **MQTT 通信**: 通过 MQTT 接收节点状态上报和心跳
+- **MQTT 通信**: 通过 MQTT 接收节点状态上报和心跳，支持远程命令
 - **嵌入式数据库**: 使用 bbolt 进行轻量级数据持久化
 
 ## 系统架构
@@ -19,7 +21,7 @@
 │                                                              │
 │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐ │
 │  │ DHCP      │  │ HTTP API │  │ iPXE     │  │ MQTT    │ │
-│  │ Server    │  │ Handler  │  │ Generator│  │ Client  │ │
+│  │ Server    │  │ Handler  │  │ Generator│  │ Broker  │ │
 │  └───────────┘  └───────────┘  └───────────┘  └─────────┘ │
 │         │              │              │              │      │
 │         └──────────────┴──────────────┴──────────────┘      │
@@ -36,7 +38,13 @@
    ┌─────┴─────┐     ┌─────┴─────┐     ┌─────┴─────┐
    │ 新节点     │     │ 安装中     │     │ 已安装     │
    │ PXE Boot  │     │ iPXE      │     │ Agent     │
+   │ (DHCP)    │     │ (Preseed) │     │ (MQTT)    │
    └───────────┘     └───────────┘     └───────────┘
+                                             │
+                              ┌──────────────┼──────────────┐
+                              │              │              │
+                         状态上报          心跳维持        命令执行
+                         (每30s)         (每30s)        (reboot等)
 ```
 
 ## 快速开始
@@ -204,6 +212,28 @@ GET /preseed/:mac/preseed.cfg
 
 返回动态生成的 Debian preseed 自动安装配置。
 
+支持查询参数传递网络配置（可选）：
+
+```
+GET /preseed/:mac/preseed.cfg?ip=192.168.1.100&netmask=255.255.255.0&gateway=192.168.1.1&dns=8.8.8.8
+```
+
+### 获取 Agent 二进制文件
+
+```bash
+GET /agent/nodefoundry-agent
+```
+
+返回 ARM64 架构的 Agent 二进制文件，用于在已安装节点上运行。
+
+### 获取 Agent systemd 服务文件
+
+```bash
+GET /agent/nodefoundry-agent.service
+```
+
+返回 systemd 服务单元文件，用于配置 Agent 自动启动。
+
 ## 节点状态
 
 节点有以下三种状态：
@@ -230,8 +260,30 @@ curl -X PUT http://localhost:8080/api/v1/nodes/aabbccddeeff \
 ```
 
 5. 节点的 iPXE 循环获取到新的安装脚本，开始安装 Debian
-6. 安装完成后，agent 自动启动并通过 MQTT 上报状态
-7. 服务器更新节点状态为 `installed`
+6. 安装过程中，preseed 的 late_command 自动下载并安装 NodeFoundry Agent
+7. 安装完成后，系统重启，Agent 通过 systemd 自动启动
+8. Agent 连接到 MQTT Broker，开始上报状态（每 30 秒）
+9. 服务器通过 MQTT 订阅接收状态，更新节点为 `installed`
+
+### Agent 功能
+
+已安装节点上运行的 NodeFoundry Agent 提供以下功能：
+
+- **状态上报**: 每 30 秒发布节点状态到 `node/<MAC>/status`
+  - 包含：IP 地址、主机名、运行时长、时间戳
+- **心跳维持**: 保持与 MQTT Broker 的连接
+- **命令执行**: 订阅 `node/<MAC>/command`，支持远程命令
+  - `reboot`: 重启节点
+- **自动重启**: 通过 systemd 配置，崩溃后自动恢复
+
+Agent 配置通过环境变量（`/etc/default/nodefoundry-agent`）：
+
+| 环境变量 | 默认值 | 说明 |
+|---------|-------|------|
+| `NF_MAC` | (自动检测) | 节点 MAC 地址 |
+| `NF_MQTT_BROKER` | `localhost:1883` | MQTT Broker 地址 |
+| `NF_LOG_LEVEL` | `info` | 日志级别 |
+| `NF_HEARTBEAT_INTERVAL` | `30` | 心跳间隔（秒） |
 
 ### 场景 2: 查询节点状态
 
@@ -243,7 +295,16 @@ curl http://localhost:8080/api/v1/nodes
 curl http://localhost:8080/api/v1/nodes/aabbccddeeff
 ```
 
-### 场景 3: 手动注册节点
+### 场景 3: 远程执行命令
+
+通过 MQTT 向已安装节点发送命令：
+
+```bash
+# 发布重启命令
+mosquitto_pub -h localhost -t "node/aabbccddeeff/command" -m '{"command":"reboot"}'
+```
+
+### 场景 4: 手动注册节点
 
 如果节点不支持自动发现，可以手动注册：
 
@@ -283,12 +344,23 @@ curl -X POST http://localhost:8080/api/v1/nodes \
 ```
 nodefoundry/
 ├── cmd/
-│   └── nodefoundry/          # 主程序入口
+│   ├── nodefoundry/          # 主程序入口
+│   └── nodefoundry-agent/    # Agent 程序入口
 ├── internal/
+│   ├── agent/                # Agent 核心功能
+│   │   ├── command/          # 命令处理器
+│   │   ├── config/           # Agent 配置
+│   │   ├── info/             # 系统信息收集
+│   │   ├── dispatcher.go     # 命令分发
+│   │   ├── mqtt.go           # MQTT 客户端
+│   │   └── netif.go          # 网络接口
 │   ├── api/                  # HTTP API 处理器
 │   ├── db/                   # 数据库层
 │   ├── dhcp/                 # DHCP 服务器
+│   │   ├── ip_pool.go        # IP 池管理
+│   │   └── server.go         # DHCP 服务器
 │   ├── ipxe/                 # iPXE 脚本生成
+│   │   └── preseed.go        # Preseed 生成
 │   ├── mqtt/                 # MQTT 客户端
 │   ├── model/                # 数据模型
 │   └── server/               # 服务器配置
@@ -303,6 +375,16 @@ nodefoundry/
 go test ./...
 ```
 
+### 构建 Agent
+
+```bash
+# 构建当前平台
+make build-agent
+
+# 构建 ARM64（RK3588 等边缘节点）
+make build-agent-arm64
+```
+
 ## 限制
 
 当前 MVP 版本的限制：
@@ -311,6 +393,59 @@ go test ./...
 2. **无认证**: API 未实现认证机制
 3. **单机部署**: 使用 bbolt 嵌入式数据库，不支持分布式
 4. **基础 DHCP**: DHCP 实现较简单，不支持复杂的网络配置
+5. **Agent 平台**: Agent 目前仅支持 linux/arm64 (RK3588)
+6. **无命令响应**: Agent 执行命令后不返回结果（仅日志记录）
+
+## 静态网络配置
+
+在标准 DHCP 模式下，NodeFoundry 支持将分配的 IP 持久化，使安装后的系统使用静态 IP：
+
+### 工作原理
+
+1. **IP 分配**: DHCP 服务器从 IP 池分配固定 IP 给节点
+2. **持久化**: 网络配置（IP、Netmask、Gateway、DNS）保存到节点记录
+3. **Preseed 生成**: iPXE 脚本将网络参数传递给 preseed URL
+4. **静态配置**: 安装时使用静态网络配置
+
+### 配置示例
+
+```bash
+# 启用 IP 池和网络配置
+export NF_DHCP_IP_POOL_START=192.168.1.100
+export NF_DHCP_IP_POOL_END=192.168.1.200
+export NF_DHCP_NETMASK=255.255.255.0
+export NF_DHCP_GATEWAY=192.168.1.1
+export NF_DHCP_DNS=192.168.1.1
+```
+
+### 验证
+
+查看节点记录中的网络配置：
+
+```bash
+curl http://localhost:8080/api/v1/nodes/aabbccddeeff
+```
+
+响应包含：
+```json
+{
+  "mac": "aabbccddeeff",
+  "ip": "192.168.1.100",
+  "netmask": "255.255.255.0",
+  "gateway": "192.168.1.1",
+  "dns": "192.168.1.1"
+}
+```
+
+### ProxyDHCP 模式
+
+在 ProxyDHCP 模式下，不分配 IP，系统安装后使用 DHCP：
+
+```bash
+export NF_DHCP_PROXY_MODE=true
+```
+
+
 
 ## DHCP 配置模式
 

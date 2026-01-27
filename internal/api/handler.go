@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -219,7 +220,10 @@ func (h *Handler) GetBootScript(c *gin.Context) {
 func (h *Handler) GetPreseed(c *gin.Context) {
 	mac := c.Param("mac")
 
-	preseed, err := h.preseedGen.Generate(c.Request.Context(), mac)
+	// 获取查询参数（网络配置）
+	query := c.Request.URL.Query()
+
+	preseed, err := h.preseedGen.GenerateWithQuery(c.Request.Context(), mac, query)
 	if err != nil {
 		errorResponse(c, http.StatusNotFound, "node not found")
 		return
@@ -231,23 +235,46 @@ func (h *Handler) GetPreseed(c *gin.Context) {
 
 // GetAgentBinary 获取 agent 二进制文件
 func (h *Handler) GetAgentBinary(c *gin.Context) {
-	// TODO: 实现实际的二进制文件返回
-	// MVP 阶段返回占位符
+	// 返回 ARM64 架构的 Agent 二进制文件
+	// 路径相对于项目根目录
+	agentPath := "bin/nodefoundry-agent-arm64"
+
+	// 检查文件是否存在
+	if _, err := os.Stat(agentPath); os.IsNotExist(err) {
+		h.logger.Error("agent binary not found", zap.String("path", agentPath))
+		errorResponse(c, http.StatusNotFound, "agent binary not found")
+		return
+	}
+
+	// 读取文件
+	data, err := os.ReadFile(agentPath)
+	if err != nil {
+		h.logger.Error("failed to read agent binary", zap.Error(err))
+		errorResponse(c, http.StatusInternalServerError, "failed to read agent binary")
+		return
+	}
+
+	// 设置响应头
 	c.Header("Content-Type", "application/octet-stream")
-	c.String(http.StatusNotImplemented, "Agent binary not implemented yet")
+	c.Header("Content-Disposition", "attachment; filename=nodefoundry-agent")
+	c.Data(http.StatusOK, "application/octet-stream", data)
+
+	h.logger.Debug("agent binary downloaded", zap.Int("size", len(data)))
 }
 
 // GetAgentServiceFile 获取 systemd 服务文件
 func (h *Handler) GetAgentServiceFile(c *gin.Context) {
 	serviceFile := `[Unit]
 Description=NodeFoundry Agent
-After=network.target mosquitto.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/nodefoundry-agent
 Restart=always
 RestartSec=10
+EnvironmentFile=/etc/default/nodefoundry-agent
 
 [Install]
 WantedBy=multi-user.target

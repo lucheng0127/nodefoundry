@@ -134,19 +134,18 @@ func (s *DHCPServer) handleStandard(conn net.PacketConn, peer net.Addr, msg *dhc
 		zap.String("peer", peer.String()),
 	)
 
-	// 创建或更新节点（状态为 discovered）
-	node, err := model.NewNode(normalizedMAC, model.STATE_DISCOVERED)
+	// 获取现有节点或创建新节点
+	node, err := s.repo.FindByMAC(context.Background(), normalizedMAC)
 	if err != nil {
-		s.logger.Error("failed to create node", zap.Error(err))
-		return
+		// 节点不存在，创建新节点
+		node, err = model.NewNode(normalizedMAC, model.STATE_DISCOVERED)
+		if err != nil {
+			s.logger.Error("failed to create node", zap.Error(err))
+			return
+		}
 	}
 
-	// 如果有 IP 地址，记录下来
-	if msg.ClientIPAddr != nil && !msg.ClientIPAddr.IsUnspecified() {
-		node.IP = msg.ClientIPAddr.String()
-	}
-
-	// 保存到数据库
+	// 保存节点信息（状态更新）
 	if err := s.repo.Save(context.Background(), node); err != nil {
 		s.logger.Error("failed to save node",
 			zap.String("mac", normalizedMAC),
@@ -155,17 +154,56 @@ func (s *DHCPServer) handleStandard(conn net.PacketConn, peer net.Addr, msg *dhc
 		return
 	}
 
-	s.logger.Info("node discovered via DHCP",
-		zap.String("mac", normalizedMAC),
-		zap.String("ip", node.IP),
-	)
-
 	// 构建 DHCPOFFER 或 DHCPACK
-	resp, err := s.buildResponse(msg)
+	resp, err := s.buildResponse(msg, normalizedMAC)
 	if err != nil {
 		s.logger.Error("failed to build DHCP response", zap.Error(err))
 		return
 	}
+
+	// 如果分配了 IP 且有 IP 管理器，持久化网络配置到节点
+	if s.ipManager != nil && resp.YourIPAddr != nil && !resp.YourIPAddr.IsUnspecified() {
+		// 更新节点的网络配置
+		node.IP = resp.YourIPAddr.String()
+		if s.ipManager.netmask != nil {
+			node.Netmask = s.ipManager.netmask.String()
+		}
+		if s.ipManager.gateway != nil {
+			node.Gateway = s.ipManager.gateway.String()
+		}
+		if len(s.ipManager.dns) > 0 {
+			dnsStr := ""
+			for i, dns := range s.ipManager.dns {
+				if i > 0 {
+					dnsStr += ","
+				}
+				dnsStr += dns.String()
+			}
+			node.DNS = dnsStr
+		}
+
+		// 保存网络配置到数据库
+		if err := s.repo.Save(context.Background(), node); err != nil {
+			s.logger.Error("failed to save network config",
+				zap.String("mac", normalizedMAC),
+				zap.Error(err),
+			)
+		} else {
+			s.logger.Info("network config saved",
+				zap.String("mac", normalizedMAC),
+				zap.String("ip", node.IP),
+				zap.String("netmask", node.Netmask),
+				zap.String("gateway", node.Gateway),
+				zap.String("dns", node.DNS),
+			)
+		}
+	}
+
+	s.logger.Info("DHCP response sent",
+		zap.String("mac", normalizedMAC),
+		zap.String("ip", node.IP),
+		zap.String("type", resp.MessageType().String()),
+	)
 
 	// 发送响应
 	if _, err := conn.WriteTo(resp.ToBytes(), peer); err != nil {
@@ -207,7 +245,7 @@ func (s *DHCPServer) handleProxyDiscover(conn net.PacketConn, peer net.Addr, msg
 }
 
 // buildResponse 构建标准 DHCP 响应
-func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
+func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4, normalizedMAC string) (*dhcpv4.DHCPv4, error) {
 	var respType dhcpv4.MessageType
 
 	switch req.MessageType() {
@@ -227,6 +265,7 @@ func (s *DHCPServer) buildResponse(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 	// 设置消息类型
 	resp.UpdateOption(dhcpv4.OptMessageType(respType))
 
+	// 使用原始 MAC 地址（保留格式）
 	mac := req.ClientHWAddr.String()
 
 	// IP 分配（如果配置了 IP 池）
